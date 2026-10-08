@@ -1,0 +1,98 @@
+{
+  "flutter": {
+    "platforms": {
+      "android": {
+        "default": {
+          "projectId": "bloomg2w",
+          "appId": "1:317086878005:android:e94b0008013e8d9c69247c",
+          "fileOutput": "android/app/google-services.json"
+        }
+      },
+      "dart": {
+        "lib/firebase_options.dart": {
+          "projectId": "bloomg2w",
+          "configurations": {
+            "android": "1:317086878005:android:e94b0008013e8d9c69247c",
+            "ios": "1:317086878005:ios:1287f37f5df0712d69247c",
+            "macos": "1:317086878005:ios:1287f37f5df0712d69247c",
+            "web": "1:317086878005:web:73867d13b43bac4969247c",
+            "windows": "1:317086878005:web:237c0d335624102c69247c"
+          }
+        }
+      }
+    }
+  },
+  "auth": {
+    "authorizedDomains": [
+      "localhost"
+    ],
+    "providers": {
+      "emailPassword": true
+    }
+  },
+  "storage": {
+    "rules": "storage.rules"
+  },
+  "firestore": {
+    "database": "bloomg2w-db",
+    "rules": "firestore.rules",
+    "indexes": "firestore.indexes.json"
+  },
+  "hosting": {
+    "public": "build/web",
+    "ignore": [
+      "firebase.json",
+      "**/.*",
+      "**/node_modules/**"
+    ],
+    "rewrites": [
+      {
+        "source": "/donation-success",
+        "destination": "/return-to-app.html"
+      },
+      {
+        "source": "/donation-cancelled",
+        "destination": "/return-to-app.html"
+      },
+      {
+        "source": "/privacy-policy",
+        "destination": "/privacy-policy.html"
+      },
+      {
+        "source": "/delete-account",
+        "destination": "/delete-account.html"
+      },
+      {
+        "source": "**",
+        "destination": "/index.html"
+      }
+    ]
+  },
+  "functions": [
+    {
+      "source": "functions",
+      "codebase": "default",
+      "ignore": [
+        "node_modules",
+        ".git",
+        "firebase-debug.log",
+        "firebase-debug.*.log",
+        "*.local"
+      ],
+      "predeploy": [
+        "npm --prefix \"$RESOURCE_DIR\" run build"
+      ]
+    }
+  ],
+  "emulators": {
+    "firestore": {
+      "port": 8080
+    },
+    "auth": {
+      "port": 9099
+    },
+    "ui": {
+      "enabled": true
+    }
+  }
+}

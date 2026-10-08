@@ -1,0 +1,29 @@
+{
+  "indexes": [
+    {
+      "collectionGroup": "session_badges",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "participantUid", "order": "ASCENDING" },
+        { "fieldPath": "redemptionId", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "session_badges",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "participantUid", "order": "ASCENDING" },
+        { "fieldPath": "celebrationSeen", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "reward_redemptions",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "partnerUid", "order": "ASCENDING" },
+        { "fieldPath": "code", "order": "ASCENDING" }
+      ]
+    }
+  ],
+  "fieldOverrides": []
+}

@@ -1,0 +1,1227 @@
+rules_version = '2';
+
+// ===============================================================
+// Assumed Data Model
+// ===============================================================
+//
+// Collection: users
+// Document ID: {uid} — matches the Firebase Auth uid of the user
+// Fields:
+//   - firstName: string (required, 1-60 chars)
+//   - lastName: string (required, 1-60 chars)
+//   - email: string (required, valid email format, immutable after create)
+//   - role: string (required, one of ['member', 'admin', 'partner', 'guestSpeaker', 'minor', 'guardian'], immutable except by an existing admin)
+//   - memberType: string (required, 0-40 chars — e.g. 'girl', 'woman', 'parent', etc.)
+//   - photoUrl: string (optional, valid https URL, < 500 chars)
+//   - createdAt: timestamp (required, server-set, immutable)
+//   - dateOfBirth: timestamp (optional on legacy docs; required for new self-created 'minor'/'member' docs — age-enforced against role at create, immutable after create)
+//   - guardianUids: list<string> (optional, default []; a 'minor' doc's linked guardians — ONLY ever written by the redeemInviteCode Cloud Function via the Admin SDK, never by any client write)
+//   - linkedChildUids: list<string> (optional, default []; a 'guardian' doc's linked minors — same write restriction as guardianUids)
+//   - inviteCode: string (optional; set only on a 'minor' doc by the Cloud Function at account-creation time, never client-writable)
+//
+// Collection: invite_codes
+// Document ID: {code} — the 6-char guardian-linking code
+// Fields: minorUid, createdAt
+// Admin-SDK only — no client reads or writes are ever permitted.
+//
+// ===============================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    // Read access to a participant-scoped doc whose ID is always
+    // "{sessionId}_{participantUid}" (registrations, check-ins, surveys,
+    // badges). When the doc exists, ownership comes from its participantUid
+    // field. When it does NOT exist yet, `resource` is null — without this
+    // branch the app's own "have I registered yet?" read (and the live
+    // listener on it) is DENIED, which blocks registration entirely. The
+    // not-yet-existing case is allowed only for IDs ending in the caller's
+    // own uid, so nobody can probe whether ANOTHER user has a doc.
+    function canReadOwnParticipantDoc(docId) {
+      return isAuthenticated() && (
+        (resource == null && docId.matches('^.+_' + request.auth.uid + '$')) ||
+        (resource != null && resource.data.participantUid == request.auth.uid)
+      );
+    }
+
+    // Same "{sessionId}_{participantUid}" doc-id convention as
+    // canReadOwnParticipantDoc, but for a GUARDIAN reading their linked
+    // minor's registration/survey/badge/check-in doc. Works for both the
+    // not-yet-existing case (parses the uid out of the id suffix) and the
+    // existing case (uses the doc's own participantUid) — kept as a
+    // separate function rather than folded into canReadOwnParticipantDoc
+    // so that function's own self-probing-prevention logic stays untouched
+    // and independently auditable.
+    function canGuardianReadParticipantDoc(docId) {
+      return isAuthenticated() && (
+        (resource == null && isLinkedGuardianOf(docId.split('_')[docId.split('_').size() - 1])) ||
+        (resource != null && isLinkedGuardianOf(resource.data.participantUid))
+      );
+    }
+
+    function hasRequiredFields(fields) {
+      return request.resource.data.keys().hasAll(fields);
+    }
+
+    function hasOnlyAllowedFields(fields) {
+      return request.resource.data.keys().hasOnly(fields);
+    }
+
+    function validStringLength(field, minLen, maxLen) {
+      return request.resource.data[field] is string &&
+        request.resource.data[field].size() >= minLen &&
+        request.resource.data[field].size() <= maxLen;
+    }
+
+    function isValidEmail(email) {
+      return email is string &&
+        email.matches("^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$");
+    }
+
+    function isValidUrl(url) {
+      return url is string && url.matches("^https://.*");
+    }
+
+    function isValidOptionalUrl(field, maxLen) {
+      return !(field in request.resource.data) ||
+        request.resource.data[field] == null ||
+        (isValidUrl(request.resource.data[field]) &&
+         request.resource.data[field].size() <= maxLen);
+    }
+
+    // Reads the requesting user's OWN role from their existing profile doc.
+    // Never trusts request.resource.data (client-supplied) for authorization.
+    function isAdmin() {
+      return isAuthenticated() &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin';
+    }
+
+    function isPartner() {
+      return isAuthenticated() &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'partner';
+    }
+
+    // True when the caller is a linked guardian of the minor with uid
+    // [minorUid] — i.e. the caller's own uid appears in that minor's
+    // guardianUids array. guardianUids is only ever written by the
+    // redeemInviteCode Cloud Function (Admin SDK), never by any client
+    // write, so this check cannot be spoofed by a client-supplied value.
+    function isLinkedGuardianOf(minorUid) {
+      return isAuthenticated() &&
+        exists(/databases/$(database)/documents/users/$(minorUid)) &&
+        get(/databases/$(database)/documents/users/$(minorUid)).data.guardianUids.hasAny([request.auth.uid]);
+    }
+
+    // Age in whole years computed from a dateOfBirth timestamp, as of now.
+    // Used only to gate 'minor' (8-17) vs 'member' (18+) at self-registration
+    // — a coarse but sufficient check since it only needs to distinguish a
+    // child from an adult, not pinpoint an exact birthday.
+    function ageYears(dob) {
+      return (request.time.toMillis() - dob.toMillis()) / (1000 * 60 * 60 * 24 * 365.25);
+    }
+
+    function isValidAgeForRole(role, dob) {
+      return dob is timestamp &&
+        (
+          (role == 'minor' && ageYears(dob) >= 8.0 && ageYears(dob) < 18.0) ||
+          (role == 'member' && ageYears(dob) >= 18.0) ||
+          (role == 'guardian' && ageYears(dob) >= 18.0) ||
+          (role != 'minor' && role != 'member' && role != 'guardian')
+        );
+    }
+
+    // Required shape for a NEW user document (self-registration).
+    // Role is force-checked to a known self-assignable value here — a user
+    // can never create their own doc with role == 'admin'. 'minor' and
+    // 'member' additionally require dateOfBirth to be present and
+    // consistent with the chosen role (8-17 for minor, 18+ for
+    // member/guardian) — this is the real security boundary for age
+    // enforcement; any client-side check is UX only.
+    function isValidNewMemberDoc() {
+      let d = request.resource.data;
+      return hasRequiredFields(['firstName', 'lastName', 'email', 'role', 'memberType', 'createdAt']) &&
+        hasOnlyAllowedFields(['firstName', 'lastName', 'email', 'role', 'memberType', 'photoUrl', 'createdAt', 'dateOfBirth', 'guardianUids', 'linkedChildUids', 'inviteCode']) &&
+        validStringLength('firstName', 1, 60) &&
+        validStringLength('lastName', 1, 60) &&
+        isValidEmail(d.email) &&
+        d.email == request.auth.token.email &&
+        (d.role == 'member' || d.role == 'partner' || d.role == 'guestSpeaker' || d.role == 'minor' || d.role == 'guardian') &&
+        validStringLength('memberType', 0, 40) &&
+        isValidOptionalUrl('photoUrl', 500) &&
+        d.createdAt == request.time &&
+        // dateOfBirth is required and age-checked for minor/member/guardian
+        // self-signups; partners/guestSpeakers aren't age-gated here.
+        ((d.role != 'minor' && d.role != 'member' && d.role != 'guardian') ||
+          (('dateOfBirth' in d) && isValidAgeForRole(d.role, d.dateOfBirth))) &&
+        // guardianUids/linkedChildUids may only ever be empty at self-create
+        // — real links are added later, exclusively by redeemInviteCode.
+        (!('guardianUids' in d) || d.guardianUids == []) &&
+        (!('linkedChildUids' in d) || d.linkedChildUids == []) &&
+        // inviteCode is never client-set — it's attached to a minor's doc
+        // separately, by the code-generation Cloud Function.
+        !('inviteCode' in d);
+    }
+
+    // Required shape when an ADMIN creates/overwrites a user doc directly
+    // (e.g. via console or an admin tool) — role may be any valid role.
+    function isValidAdminWrittenDoc() {
+      let d = request.resource.data;
+      return hasRequiredFields(['firstName', 'lastName', 'email', 'role', 'memberType', 'createdAt']) &&
+        hasOnlyAllowedFields(['firstName', 'lastName', 'email', 'role', 'memberType', 'photoUrl', 'createdAt', 'dateOfBirth', 'guardianUids', 'linkedChildUids', 'inviteCode']) &&
+        validStringLength('firstName', 1, 60) &&
+        validStringLength('lastName', 1, 60) &&
+        isValidEmail(d.email) &&
+        (d.role == 'member' || d.role == 'admin' || d.role == 'partner' || d.role == 'guestSpeaker' || d.role == 'minor' || d.role == 'guardian') &&
+        validStringLength('memberType', 0, 40) &&
+        isValidOptionalUrl('photoUrl', 500);
+    }
+
+    // A self-update to a member's OWN profile: everything except email/
+    // createdAt/guardianUids/linkedChildUids/inviteCode may change, and
+    // those fields must stay exactly as they were before. Role may only
+    // move member -> guestSpeaker (applying to become a Guest Speaker
+    // grants no real privileges — separate approval gates the
+    // speaker_applications collection). Every other role transition
+    // (including anything -> admin, or -> partner) is blocked here; those
+    // require an admin write. guardianUids/linkedChildUids are guardian-
+    // link state and may ONLY ever be changed by the redeemInviteCode
+    // Cloud Function (Admin SDK, bypasses these rules entirely) — a user
+    // self-editing their own doc, including a minor or a guardian, can
+    // never add/remove a link themselves.
+    function isValidSelfUpdate() {
+      let d = request.resource.data;
+      let before = resource.data;
+      let roleUnchanged = d.role == before.role;
+      let becomingGuestSpeaker = before.role == 'member' && d.role == 'guestSpeaker';
+      let guardianUidsUnchanged = (!('guardianUids' in before) && !('guardianUids' in d)) ||
+        d.guardianUids == (('guardianUids' in before) ? before.guardianUids : []);
+      let linkedChildUidsUnchanged = (!('linkedChildUids' in before) && !('linkedChildUids' in d)) ||
+        d.linkedChildUids == (('linkedChildUids' in before) ? before.linkedChildUids : []);
+      let inviteCodeUnchanged = (!('inviteCode' in before) && !('inviteCode' in d)) ||
+        (('inviteCode' in before) && ('inviteCode' in d) && d.inviteCode == before.inviteCode);
+      return hasRequiredFields(['firstName', 'lastName', 'email', 'role', 'memberType', 'createdAt']) &&
+        hasOnlyAllowedFields(['firstName', 'lastName', 'email', 'role', 'memberType', 'photoUrl', 'createdAt', 'dateOfBirth', 'guardianUids', 'linkedChildUids', 'inviteCode']) &&
+        validStringLength('firstName', 1, 60) &&
+        validStringLength('lastName', 1, 60) &&
+        d.email == before.email &&
+        (roleUnchanged || becomingGuestSpeaker) &&
+        d.createdAt == before.createdAt &&
+        validStringLength('memberType', 0, 40) &&
+        isValidOptionalUrl('photoUrl', 500) &&
+        guardianUidsUnchanged &&
+        linkedChildUidsUnchanged &&
+        inviteCodeUnchanged;
+    }
+
+    match /users/{userId} {
+      // Read: a user may read their own profile; an admin may read any
+      // profile; a linked guardian may read their linked minor's profile
+      // (needed for Parent Portal to show the child's name/photo).
+      // (No blanket isAuthenticated() read — this collection holds PII.)
+      allow read: if isOwner(userId) || isAdmin() || isLinkedGuardianOf(userId);
+
+      // Create: a user may create their OWN doc, with a self-assignable
+      // role (see isValidNewMemberDoc). An admin may create any doc,
+      // including role 'admin'.
+      allow create: if (isOwner(userId) && isValidNewMemberDoc()) ||
+                       (isAdmin() && isValidAdminWrittenDoc());
+
+      // Update: a user may update their own doc but cannot change role
+      // (except member->guestSpeaker), email, createdAt, or guardian-link
+      // state. An admin may update anyone's doc, including role and links.
+      allow update: if (isOwner(userId) && isValidSelfUpdate()) ||
+                       (isAdmin() && isValidAdminWrittenDoc());
+
+      // Delete: admin only.
+      allow delete: if isAdmin();
+    }
+
+    // ===============================================================
+    // Collection: invite_codes
+    // Admin-SDK only (the redeemInviteCode / code-generation Cloud
+    // Functions use the Admin SDK, which bypasses these rules entirely).
+    // No client, of any role, may ever read or write this collection
+    // directly — codes are resolved to a minorUid exclusively server-side.
+    // ===============================================================
+    match /invite_codes/{code} {
+      allow read, write: if false;
+    }
+
+    // ===============================================================
+    // Collection: partners
+    // Document ID: {uid} — matches the partner's Firebase Auth uid
+    // Fields: businessName, contactPerson, email, phone, website,
+    //   description, supportTypes (list<string>), contributionDetails,
+    //   logoUrl (optional), status ('pending'|'approved'|'rejected'|
+    //   'suspended'), statusUpdatedAt, statusUpdatedBy (admin-only after
+    //   create), createdAt (server-set, immutable)
+    // Contains contact PII — owner + admin only, same as users/.
+    // A newly-registered partner always starts status == 'pending' and
+    // is invisible to members (see partner_profiles below) until an
+    // admin approves them — status/statusUpdatedAt/statusUpdatedBy are
+    // admin-only to change after creation.
+    // ===============================================================
+
+    function isValidNewPartnerDoc() {
+      let d = request.resource.data;
+      return hasRequiredFields(['businessName', 'contactPerson', 'email', 'phone', 'website', 'description', 'supportTypes', 'contributionDetails', 'status', 'statusUpdatedAt', 'statusUpdatedBy', 'createdAt']) &&
+        hasOnlyAllowedFields(['businessName', 'contactPerson', 'email', 'phone', 'website', 'description', 'supportTypes', 'contributionDetails', 'logoUrl', 'status', 'statusUpdatedAt', 'statusUpdatedBy', 'createdAt']) &&
+        validStringLength('businessName', 1, 100) &&
+        validStringLength('contactPerson', 1, 100) &&
+        isValidEmail(d.email) &&
+        validStringLength('phone', 0, 30) &&
+        validStringLength('website', 0, 200) &&
+        validStringLength('description', 0, 1000) &&
+        d.supportTypes is list && d.supportTypes.size() <= 10 &&
+        validStringLength('contributionDetails', 0, 1000) &&
+        isValidOptionalUrl('logoUrl', 500) &&
+        d.status == 'pending' &&
+        d.statusUpdatedAt == null &&
+        d.statusUpdatedBy == null;
+    }
+
+    // A partner may edit their own business info but never their own
+    // approval status — that field only ever changes via
+    // isValidAdminPartnerStatusUpdate below.
+    function isValidPartnerSelfEdit() {
+      let d = request.resource.data;
+      return hasOnlyAllowedFields(['businessName', 'contactPerson', 'email', 'phone', 'website', 'description', 'supportTypes', 'contributionDetails', 'logoUrl', 'status', 'statusUpdatedAt', 'statusUpdatedBy', 'createdAt']) &&
+        validStringLength('businessName', 1, 100) &&
+        validStringLength('contactPerson', 1, 100) &&
+        isValidEmail(d.email) &&
+        validStringLength('phone', 0, 30) &&
+        validStringLength('website', 0, 200) &&
+        validStringLength('description', 0, 1000) &&
+        d.supportTypes is list && d.supportTypes.size() <= 10 &&
+        validStringLength('contributionDetails', 0, 1000) &&
+        isValidOptionalUrl('logoUrl', 500) &&
+        d.status == resource.data.status &&
+        d.statusUpdatedAt == resource.data.statusUpdatedAt &&
+        d.statusUpdatedBy == resource.data.statusUpdatedBy &&
+        d.createdAt == resource.data.createdAt;
+    }
+
+    // Admin approval/rejection/suspension: only status/statusUpdatedAt/
+    // statusUpdatedBy may change; every partner-authored field is
+    // immutable to admin review (an admin reviews, never rewrites, a
+    // partner's submitted business information).
+    function isValidAdminPartnerStatusUpdate() {
+      let d = request.resource.data;
+      return d.businessName == resource.data.businessName &&
+        d.contactPerson == resource.data.contactPerson &&
+        d.email == resource.data.email &&
+        d.phone == resource.data.phone &&
+        d.website == resource.data.website &&
+        d.description == resource.data.description &&
+        d.supportTypes == resource.data.supportTypes &&
+        d.contributionDetails == resource.data.contributionDetails &&
+        d.createdAt == resource.data.createdAt &&
+        d.status in ['pending', 'approved', 'rejected', 'suspended'] &&
+        d.statusUpdatedBy == request.auth.uid;
+    }
+
+    match /partners/{partnerId} {
+      allow read: if isOwner(partnerId) || isAdmin();
+      allow create: if (isOwner(partnerId) && isValidNewPartnerDoc()) || (isAdmin() && isValidNewPartnerDoc());
+      allow update: if (isOwner(partnerId) && isValidPartnerSelfEdit()) || (isAdmin() && isValidAdminPartnerStatusUpdate());
+      allow delete: if isAdmin();
+    }
+
+    // ===============================================================
+    // Collection: partner_profiles
+    // Document ID: {uid} — matches the partner's Firebase Auth uid
+    // Fields: businessName, description, supportTypes (list<string>),
+    //   logoUrl (optional), createdAt (server-set, immutable)
+    // PII-free public mirror of partners/{uid} — written ONLY by the
+    // client's approvePartner()/setPartnerStatus() calls (admin-gated at
+    // the application layer, and only an admin's write reaches this rule
+    // since a non-admin partner can never construct this doc themselves —
+    // see the create/delete rules below). A doc existing here at all
+    // means an admin has approved that partner; deleting it (on
+    // reject/suspend) retracts the partner from the member-facing
+    // directory. Any signed-in member may READ this collection.
+    // ===============================================================
+
+    function isValidPublicPartnerDoc() {
+      let d = request.resource.data;
+      return hasRequiredFields(['businessName', 'description', 'supportTypes', 'createdAt']) &&
+        hasOnlyAllowedFields(['businessName', 'description', 'supportTypes', 'logoUrl', 'createdAt']) &&
+        validStringLength('businessName', 1, 100) &&
+        validStringLength('description', 0, 1000) &&
+        d.supportTypes is list && d.supportTypes.size() <= 10 &&
+        isValidOptionalUrl('logoUrl', 500);
+    }
+
+    match /partner_profiles/{partnerId} {
+      // Read: any signed-in member may browse the directory. This
+      // collection is defined to hold no PII, so a broad authenticated
+      // read is safe.
+      allow read: if isAuthenticated();
+
+      // Write: admin only — publishing/retracting a partner's public
+      // directory entry is exclusively an approval-workflow action, never
+      // something the partner does for themself (which would let an
+      // unapproved partner self-publish).
+      allow create: if isAdmin() && isValidPublicPartnerDoc();
+      allow update: if isAdmin() && isValidPublicPartnerDoc();
+      allow delete: if isAdmin();
+    }
+
+    // ===============================================================
+    // Collection: rewards
+    // Document ID: auto-generated
+    // Fields: partnerUid (immutable owner ref), partnerName, name, value,
+    //   quantityAvailable (fixed at creation), remainingQuantity
+    //   (decremented only by the redeemReward Cloud Function transaction),
+    //   badgeCost (number, admin/partner-configured — never hard-coded),
+    //   description, expirationDate (optional), restrictions (optional),
+    //   active (bool, partner-controlled pause toggle), status
+    //   ('pending'|'approved'|'paused'|'expired'|'depleted'|'rejected',
+    //   admin-controlled approval lifecycle — separate from active),
+    //   reviewNotes (admin-only), createdAt (server-set, immutable)
+    // This is an OFFER TEMPLATE, not a single redeemable unit — many
+    // participants redeem from the same reward while remainingQuantity
+    // lasts. Each individual claim is its own reward_redemptions doc with
+    // its own unique one-time code (see below). No PII — any signed-in
+    // member may READ (Rewards Marketplace browsing filters to status ==
+    // 'approved' client-side in the query itself, but this rule still
+    // allows any authenticated read since the doc holds no PII/secrets —
+    // a pending reward's mere existence isn't sensitive). Only the owning
+    // partner or an admin may write, and remainingQuantity may only ever
+    // be changed by the trusted redeemReward transaction (Admin SDK,
+    // bypasses these rules) — never directly by a partner or participant.
+    // A reward NEVER starts approved: a partner proposing one always
+    // starts status == 'pending', and only an admin's write may move it
+    // to 'approved' (or reject it) — see isValidAdminRewardReview.
+    // ===============================================================
+
+    function isValidNewRewardDoc() {
+      let d = request.resource.data;
+      return hasRequiredFields(['partnerUid', 'partnerName', 'name', 'value', 'quantityAvailable', 'remainingQuantity', 'badgeCost', 'description', 'active', 'status', 'reviewNotes', 'createdAt']) &&
+        hasOnlyAllowedFields(['partnerUid', 'partnerName', 'name', 'value', 'quantityAvailable', 'remainingQuantity', 'badgeCost', 'description', 'expirationDate', 'restrictions', 'active', 'status', 'reviewNotes', 'createdAt']) &&
+        d.partnerUid == request.auth.uid &&
+        validStringLength('partnerName', 0, 100) &&
+        validStringLength('name', 1, 100) &&
+        d.value is number && d.value >= 0 && d.value <= 100000 &&
+        d.quantityAvailable is number && d.quantityAvailable >= 0 && d.quantityAvailable <= 100000 &&
+        d.remainingQuantity == d.quantityAvailable &&
+        d.badgeCost is number && d.badgeCost >= 1 && d.badgeCost <= 1000 &&
+        validStringLength('description', 0, 1000) &&
+        d.active == true &&
+        d.status == 'pending' &&
+        d.reviewNotes == '' &&
+        d.createdAt == request.time;
+    }
+
+    // The owning partner may edit an offer's presentation and their own
+    // active pause toggle, but never remainingQuantity, quantityAvailable,
+    // ownership fields, status, or reviewNotes — a partner can pause
+    // their own approved reward, but can never self-approve, un-reject,
+    // or rewrite the admin's review notes.
+    function isValidPartnerRewardEdit() {
+      let d = request.resource.data;
+      return hasOnlyAllowedFields(['partnerUid', 'partnerName', 'name', 'value', 'quantityAvailable', 'remainingQuantity', 'badgeCost', 'description', 'expirationDate', 'restrictions', 'active', 'status', 'reviewNotes', 'createdAt']) &&
+        d.partnerUid == resource.data.partnerUid &&
+        d.partnerName == resource.data.partnerName &&
+        d.quantityAvailable == resource.data.quantityAvailable &&
+        d.remainingQuantity == resource.data.remainingQuantity &&
+        d.status == resource.data.status &&
+        d.reviewNotes == resource.data.reviewNotes &&
+        d.createdAt == resource.data.createdAt &&
+        validStringLength('name', 1, 100) &&
+        d.value is number && d.value >= 0 && d.value <= 100000 &&
+        d.badgeCost is number && d.badgeCost >= 1 && d.badgeCost <= 1000 &&
+        validStringLength('description', 0, 1000) &&
+        d.active is bool;
+    }
+
+    // Admin review: only status/reviewNotes may change; every
+    // partner-authored field (including the partner's own active toggle)
+    // is immutable to an admin's review action, so approving a reward
+    // can never silently alter what the partner actually proposed.
+    function isValidAdminRewardReview() {
+      let d = request.resource.data;
+      return hasOnlyAllowedFields(['partnerUid', 'partnerName', 'name', 'value', 'quantityAvailable', 'remainingQuantity', 'badgeCost', 'description', 'expirationDate', 'restrictions', 'active', 'status', 'reviewNotes', 'createdAt']) &&
+        d.partnerUid == resource.data.partnerUid &&
+        d.partnerName == resource.data.partnerName &&
+        d.name == resource.data.name &&
+        d.value == resource.data.value &&
+        d.quantityAvailable == resource.data.quantityAvailable &&
+        d.remainingQuantity == resource.data.remainingQuantity &&
+        d.badgeCost == resource.data.badgeCost &&
+        d.description == resource.data.description &&
+        d.active == resource.data.active &&
+        d.createdAt == resource.data.createdAt &&
+        d.status in ['pending', 'approved', 'paused', 'expired', 'depleted', 'rejected'] &&
+        validStringLength('reviewNotes', 0, 1000);
+    }
+
+    match /rewards/{rewardId} {
+      // Read: any signed-in member can browse the marketplace; the owning
+      // partner and admins can also read.
+      allow read: if isAuthenticated();
+
+      // Create: only a partner may create a reward offer, and only under
+      // their own uid.
+      allow create: if isPartner() && isValidNewRewardDoc();
+
+      // Update: the owning partner may edit presentation fields and
+      // toggle their own active pause flag; an admin may separately
+      // review (approve/reject/pause) via status/reviewNotes only.
+      allow update: if (isPartner() && resource.data.partnerUid == request.auth.uid && isValidPartnerRewardEdit()) ||
+                       (isAdmin() && isValidAdminRewardReview());
+
+      // Delete: admin only.
+      allow delete: if isAdmin();
+    }
+
+    // ===============================================================
+    // Collection: reward_redemptions
+    // Document ID: auto-generated
+    // Fields: rewardId, rewardName, partnerUid, partnerName,
+    //   participantUid, badgeCost, code (unique one-time redemption code),
+    //   status ('pending'|'used'), createdAt, usedAt, usedByPartnerUid
+    // Written EXCLUSIVELY by the redeemReward and markRedemptionUsed Cloud
+    // Functions via the Admin SDK (bypasses these rules) — there is
+    // deliberately NO client create/update path. A participant can never
+    // mint their own redemption code, and a partner can never mark a code
+    // used except through the trusted, atomic markRedemptionUsed function
+    // (which also scopes the code lookup to the calling partner's own
+    // uid, so one partner can never probe or redeem another's codes).
+    // This match block exists only to grant read access.
+    // ===============================================================
+
+    match /reward_redemptions/{redemptionId} {
+      // Read: the redeeming participant (their own reward codes), the
+      // owning partner (to see their redemption history), or an admin.
+      allow read: if isAdmin() ||
+        (isAuthenticated() && resource.data.participantUid == request.auth.uid) ||
+        (isAuthenticated() && resource.data.partnerUid == request.auth.uid);
+      allow write: if false;
+    }
+
+    // ===============================================================
+    // Collection: speaker_applications
+    // Document ID: {uid} — matches the applicant's Firebase Auth uid
+    // Fields: fullName, photoUrl, email, phone, cityState, professionalTitle,
+    //   profession, organization, yearsExperience, linkedInUrl, education,
+    //   certifications, professionalExperience, volunteerExperience,
+    //   previousSpeakingExperience, speakingTopic, presentationTitle,
+    //   presentationDescription, targetAudiences (list), expertiseAreas (list),
+    //   otherExpertiseDetail, availability, availableDaysTimes, whySpeak,
+    //   additionalInfo, status ('pending'|'approved'|'changesRequested'|'declined'),
+    //   published (bool, admin-only), adminNotes, createdAt (server-set, immutable)
+    // Contains contact PII (email/phone) — owner + admin only. The public-safe
+    // Bureau view is built client-side from an approved+published doc's
+    // non-PII fields only (never expose this collection to a blanket read).
+    // ===============================================================
+
+    function isValidNewSpeakerApplication() {
+      let d = request.resource.data;
+      return hasRequiredFields(['fullName', 'email', 'phone', 'profession', 'speakingTopic', 'presentationDescription', 'targetAudiences', 'expertiseAreas', 'availability', 'status', 'published', 'createdAt']) &&
+        hasOnlyAllowedFields(['fullName', 'photoUrl', 'email', 'phone', 'cityState', 'professionalTitle', 'profession', 'organization', 'yearsExperience', 'linkedInUrl', 'education', 'certifications', 'professionalExperience', 'volunteerExperience', 'previousSpeakingExperience', 'speakingTopic', 'presentationTitle', 'presentationDescription', 'targetAudiences', 'expertiseAreas', 'otherExpertiseDetail', 'availability', 'availableDaysTimes', 'whySpeak', 'additionalInfo', 'status', 'published', 'adminNotes', 'createdAt']) &&
+        validStringLength('fullName', 1, 100) &&
+        isValidEmail(d.email) &&
+        validStringLength('phone', 1, 30) &&
+        validStringLength('profession', 1, 100) &&
+        validStringLength('speakingTopic', 1, 150) &&
+        validStringLength('presentationDescription', 1, 1500) &&
+        d.targetAudiences is list && d.targetAudiences.size() <= 10 &&
+        d.expertiseAreas is list && d.expertiseAreas.size() <= 20 &&
+        d.status == 'pending' &&
+        d.published == false;
+    }
+
+    // A speaker may re-submit/edit their own application while it is still
+    // pending or changes were requested — but never touch status/published,
+    // and never edit an already-approved or declined application (admin
+    // controls that state from there).
+    function isValidSpeakerSelfUpdate() {
+      let d = request.resource.data;
+      return hasRequiredFields(['fullName', 'email', 'phone', 'profession', 'speakingTopic', 'presentationDescription', 'targetAudiences', 'expertiseAreas', 'availability', 'status', 'published', 'createdAt']) &&
+        hasOnlyAllowedFields(['fullName', 'photoUrl', 'email', 'phone', 'cityState', 'professionalTitle', 'profession', 'organization', 'yearsExperience', 'linkedInUrl', 'education', 'certifications', 'professionalExperience', 'volunteerExperience', 'previousSpeakingExperience', 'speakingTopic', 'presentationTitle', 'presentationDescription', 'targetAudiences', 'expertiseAreas', 'otherExpertiseDetail', 'availability', 'availableDaysTimes', 'whySpeak', 'additionalInfo', 'status', 'published', 'adminNotes', 'createdAt']) &&
+        validStringLength('fullName', 1, 100) &&
+        isValidEmail(d.email) &&
+        validStringLength('phone', 1, 30) &&
+        validStringLength('profession', 1, 100) &&
+        validStringLength('speakingTopic', 1, 150) &&
+        validStringLength('presentationDescription', 1, 1500) &&
+        (resource.data.status == 'pending' || resource.data.status == 'changesRequested') &&
+        d.status == resource.data.status &&
+        d.published == resource.data.published &&
+        d.createdAt == resource.data.createdAt;
+    }
+
+    // Admin review action: only status/published/adminNotes may change;
+    // every applicant-authored field must stay exactly the same, so an
+    // admin reviewing an application can't silently rewrite its content.
+    function isValidAdminSpeakerReview() {
+      let d = request.resource.data;
+      return d.fullName == resource.data.fullName &&
+        d.email == resource.data.email &&
+        d.phone == resource.data.phone &&
+        d.speakingTopic == resource.data.speakingTopic &&
+        d.presentationDescription == resource.data.presentationDescription &&
+        d.createdAt == resource.data.createdAt &&
+        (d.status == 'pending' || d.status == 'approved' || d.status == 'changesRequested' || d.status == 'declined') &&
+        d.published is bool;
+    }
+
+    match /speaker_applications/{applicantId} {
+      allow read: if isOwner(applicantId) || isAdmin();
+      allow create: if isOwner(applicantId) && isValidNewSpeakerApplication();
+      allow update: if (isOwner(applicantId) && isValidSpeakerSelfUpdate()) || (isAdmin() && isValidAdminSpeakerReview());
+      allow delete: if isAdmin();
+    }
+
+    // ===============================================================
+    // Collection: speaker_profiles
+    // Document ID: {uid} — matches the speaker's Firebase Auth uid
+    // Fields: fullName, photoUrl, professionalTitle, profession,
+    //   organization, yearsExperience, professionalExperience,
+    //   speakingTopic, presentationTitle, presentationDescription,
+    //   targetAudiences (list), expertiseAreas (list), publishedAt
+    // Public, PII-free mirror of an approved+published speaker_applications
+    // doc — written only by the app's admin publish/unpublish action,
+    // never directly by a client write. This is what the member-facing
+    // Guest Speakers Bureau actually reads.
+    // ===============================================================
+
+    match /speaker_profiles/{speakerId} {
+      // Read: any signed-in member may browse the Bureau. This collection
+      // is defined to hold no PII (no email/phone/address), so a broad
+      // authenticated read is safe.
+      allow read: if isAuthenticated();
+
+      // Write: admin only — this doc is derived from an approved
+      // application by the publish/unpublish action, never client-authored
+      // by the speaker themself.
+      allow write: if isAdmin();
+    }
+
+    // ===============================================================
+    // Collection: speaker_interests
+    // Document ID: auto-generated
+    // Fields: speakerUid, speakerName, memberUid (immutable owner ref),
+    //   interestType, audienceGroup, notified (bool, admin-only),
+    //   createdAt (server-set, immutable)
+    // No direct member-to-speaker contact is ever stored here — Project
+    // Bloom administration reads this to coordinate scheduling.
+    // ===============================================================
+
+    function isValidNewInterestDoc() {
+      let d = request.resource.data;
+      return hasRequiredFields(['speakerUid', 'speakerName', 'memberUid', 'interestType', 'audienceGroup', 'notified', 'createdAt']) &&
+        hasOnlyAllowedFields(['speakerUid', 'speakerName', 'memberUid', 'interestType', 'audienceGroup', 'notified', 'createdAt']) &&
+        d.memberUid == request.auth.uid &&
+        validStringLength('speakerUid', 1, 128) &&
+        validStringLength('speakerName', 0, 100) &&
+        d.interestType in ['attend', 'scheduleRequest', 'topicInterest', 'notifyWhenScheduled'] &&
+        validStringLength('audienceGroup', 0, 60) &&
+        d.notified == false;
+    }
+
+    match /speaker_interests/{interestId} {
+      // Read: the member who submitted it, or an admin (interest tracking
+      // dashboard). No speaker-to-member visibility — prevents any
+      // speaker from building a list of who is interested in them.
+      allow read: if isAdmin() || (isAuthenticated() && resource.data.memberUid == request.auth.uid);
+
+      // Create: any signed-in member, only under their own uid.
+      allow create: if isAuthenticated() && isValidNewInterestDoc();
+
+      // Update: admin only (marking notified after a speaker is scheduled).
+      allow update: if isAdmin() &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['notified']);
+
+      allow delete: if isAdmin();
+    }
+
+    // ===============================================================
+    // Collection: support_messages
+    // Document ID: auto-generated
+    // Fields: uid (immutable owner ref), userName, userEmail,
+    //   type ('contact'|'reportProblem'|'feedback'), category, subject,
+    //   message, status ('open'|'resolved', admin-only), adminNotes
+    //   (admin-only), createdAt (server-set, immutable)
+    // Contains the submitter's name/email (denormalized) plus their
+    // message — owner + admin only, same PII posture as users/.
+    // ===============================================================
+
+    function isValidNewSupportMessage() {
+      let d = request.resource.data;
+      return hasRequiredFields(['uid', 'userName', 'userEmail', 'type', 'category', 'subject', 'message', 'status', 'adminNotes', 'createdAt']) &&
+        hasOnlyAllowedFields(['uid', 'userName', 'userEmail', 'type', 'category', 'subject', 'message', 'status', 'adminNotes', 'createdAt']) &&
+        d.uid == request.auth.uid &&
+        validStringLength('userName', 0, 100) &&
+        isValidEmail(d.userEmail) &&
+        d.type in ['contact', 'reportProblem', 'feedback'] &&
+        validStringLength('category', 0, 60) &&
+        validStringLength('subject', 0, 150) &&
+        validStringLength('message', 1, 3000) &&
+        d.status == 'open' &&
+        d.adminNotes == '';
+    }
+
+    // Admin triage: only status/adminNotes may change; the submitter's
+    // original message content is immutable so triage can never rewrite
+    // what a user actually submitted.
+    function isValidAdminSupportUpdate() {
+      let d = request.resource.data;
+      return d.uid == resource.data.uid &&
+        d.userName == resource.data.userName &&
+        d.userEmail == resource.data.userEmail &&
+        d.type == resource.data.type &&
+        d.subject == resource.data.subject &&
+        d.message == resource.data.message &&
+        d.createdAt == resource.data.createdAt &&
+        (d.status == 'open' || d.status == 'resolved');
+    }
+
+    match /support_messages/{messageId} {
+      // Read: the submitting user, or an admin (support portal).
+      allow read: if isAdmin() || (isAuthenticated() && resource.data.uid == request.auth.uid);
+
+      // Create: any signed-in user, only under their own uid.
+      allow create: if isAuthenticated() && isValidNewSupportMessage();
+
+      // Update: admin only (marking resolved / adding triage notes).
+      allow update: if isAdmin() && isValidAdminSupportUpdate();
+
+      allow delete: if isAdmin();
+    }
+
+    // ===============================================================
+    // Collection: membership_applications
+    // Document ID: auto-generated
+    // Fields: uid (immutable owner ref), type ('girls'|'women'), fullName,
+    //   dateOfBirth, email, phone, parentName, parentEmail, parentPhone,
+    //   parentConsent (bool), interests (list<string>), membershipQuestion,
+    //   acceptedTerms (bool), status ('pending'|'approved'|'declined',
+    //   admin-only), adminNotes (admin-only), createdAt (server-set, immutable)
+    // Contains contact PII for both the applicant and, for Girls
+    // Membership, their parent/guardian — owner + admin only.
+    // ===============================================================
+
+    function isValidNewMembershipApplication() {
+      let d = request.resource.data;
+      return hasRequiredFields(['uid', 'type', 'fullName', 'dateOfBirth', 'email', 'phone', 'parentName', 'parentEmail', 'parentPhone', 'parentConsent', 'interests', 'membershipQuestion', 'acceptedTerms', 'status', 'adminNotes', 'createdAt']) &&
+        hasOnlyAllowedFields(['uid', 'type', 'fullName', 'dateOfBirth', 'email', 'phone', 'parentName', 'parentEmail', 'parentPhone', 'parentConsent', 'interests', 'membershipQuestion', 'acceptedTerms', 'status', 'adminNotes', 'createdAt']) &&
+        d.uid == request.auth.uid &&
+        d.type in ['girls', 'women'] &&
+        validStringLength('fullName', 1, 100) &&
+        validStringLength('dateOfBirth', 0, 20) &&
+        isValidEmail(d.email) &&
+        validStringLength('phone', 0, 30) &&
+        validStringLength('parentName', 0, 100) &&
+        validStringLength('parentEmail', 0, 100) &&
+        validStringLength('parentPhone', 0, 30) &&
+        d.parentConsent is bool &&
+        d.interests is list && d.interests.size() <= 20 &&
+        validStringLength('membershipQuestion', 0, 1000) &&
+        d.acceptedTerms is bool &&
+        d.status == 'pending' &&
+        d.adminNotes == '';
+    }
+
+    // Admin triage: only status/adminNotes may change; the applicant's
+    // original submission is immutable so review can never rewrite it.
+    function isValidAdminMembershipUpdate() {
+      let d = request.resource.data;
+      return d.uid == resource.data.uid &&
+        d.type == resource.data.type &&
+        d.fullName == resource.data.fullName &&
+        d.email == resource.data.email &&
+        d.interests == resource.data.interests &&
+        d.acceptedTerms == resource.data.acceptedTerms &&
+        d.createdAt == resource.data.createdAt &&
+        (d.status == 'pending' || d.status == 'approved' || d.status == 'declined');
+    }
+
+    match /membership_applications/{applicationId} {
+      // Read: the submitting user, or an admin (membership review portal).
+      allow read: if isAdmin() || (isAuthenticated() && resource.data.uid == request.auth.uid);
+
+      // Create: any signed-in user, only under their own uid.
+      allow create: if isAuthenticated() && isValidNewMembershipApplication();
+
+      // Update: admin only (approve / decline / add notes).
+      allow update: if isAdmin() && isValidAdminMembershipUpdate();
+
+      allow delete: if isAdmin();
+    }
+
+    // ===============================================================
+    // Collection: bloom_sessions
+    // Document ID: auto-generated
+    // Fields: title, topic, description, date (timestamp), startTime,
+    //   endTime, zoomMeetingLink, zoomMeetingId, zoomPasscode,
+    //   minAttendancePercent (number), program, ageGroup,
+    //   status ('draft'|'published'|'cancelled'|'completed'),
+    //   registrationDeadline (optional timestamp), guestSpeakerUid
+    //   (optional, references speaker_profiles/{uid}),
+    //   guestSpeakerNameSnapshot (optional), cancellationReason (optional),
+    //   createdAt (server-set, immutable)
+    // No participant PII. Admin-authored and admin-managed entirely;
+    // members only ever read published sessions.
+    // ===============================================================
+
+    function isValidSessionDoc() {
+      let d = request.resource.data;
+      return hasRequiredFields(['title', 'topic', 'description', 'date', 'startTime', 'endTime', 'zoomMeetingLink', 'zoomMeetingId', 'zoomPasscode', 'minAttendancePercent', 'program', 'ageGroup', 'status']) &&
+        hasOnlyAllowedFields(['title', 'topic', 'description', 'date', 'startTime', 'endTime', 'zoomMeetingLink', 'zoomMeetingId', 'zoomPasscode', 'minAttendancePercent', 'program', 'ageGroup', 'status', 'registrationDeadline', 'guestSpeakerUid', 'guestSpeakerNameSnapshot', 'cancellationReason', 'createdAt']) &&
+        validStringLength('title', 1, 150) &&
+        validStringLength('topic', 0, 150) &&
+        validStringLength('description', 0, 3000) &&
+        d.date is timestamp &&
+        validStringLength('startTime', 0, 20) &&
+        validStringLength('endTime', 0, 20) &&
+        validStringLength('zoomMeetingLink', 0, 500) &&
+        validStringLength('zoomMeetingId', 0, 60) &&
+        validStringLength('zoomPasscode', 0, 30) &&
+        d.minAttendancePercent is number && d.minAttendancePercent >= 0 && d.minAttendancePercent <= 100 &&
+        validStringLength('program', 0, 100) &&
+        validStringLength('ageGroup', 0, 60) &&
+        d.status in ['draft', 'published', 'cancelled', 'completed'];
+    }
+
+    match /bloom_sessions/{sessionId} {
+      // Read: admins see everything; any signed-in member may read a
+      // published session (so they can browse upcoming sessions).
+      //
+      // KNOWN LIMITATION (QA L-3): this also exposes zoomMeetingLink and
+      // zoomPasscode to every signed-in member, including partners and
+      // non-registrants, not just the session's own registrants — a
+      // Zoom-bombing risk, mitigated today only by the waiting room Zoom
+      // meetings are created with (see createMeetingForUser). Fixing this
+      // properly means moving join details to a registrant-readable
+      // subcollection (the same pattern already used for the host-only
+      // zoomHost link below), which is a real data-model and rules change
+      // deliberately deferred rather than rushed in alongside this QA
+      // pass's other fixes.
+      allow read: if isAdmin() || (isAuthenticated() && resource.data.status == 'published');
+
+      // Write: admin only — this is entirely an admin-managed collection.
+      allow create: if isAdmin() && isValidSessionDoc();
+      allow update: if isAdmin() && isValidSessionDoc();
+      allow delete: if isAdmin();
+
+      // ===============================================================
+      // Subcollection: bloom_sessions/{sessionId}/private/zoomHost
+      // Fields: startUrl (Zoom host-only start link), hostEmail,
+      //   speakerUid, updatedAt
+      // Written EXCLUSIVELY by the createZoomMeetingForSession Cloud
+      // Function via the Admin SDK (bypasses these rules) — never by any
+      // client. Exists separately from the parent session doc specifically
+      // so the host-only start link is never exposed to the broad
+      // "any signed-in member may read a published session" rule above:
+      // only the admin and the one speaker assigned to this session may
+      // read it.
+      // ===============================================================
+
+      match /private/{docId} {
+        allow read: if isAdmin() || (isAuthenticated() && resource.data.speakerUid == request.auth.uid);
+        allow write: if false;
+      }
+    }
+
+    // ===============================================================
+    // Collection: session_registrations
+    // Document ID: "{sessionId}_{participantUid}" — enforces one active
+    //   registration per participant per session structurally.
+    // Fields: sessionId, participantUid (immutable owner ref),
+    //   participantName, registeredAt (server-set, immutable),
+    //   status ('registered'|'checkInAvailable'|'joinAvailable'|
+    //   'attended'|'completed'|'cancelled'|'missed', admin-only after
+    //   create), notified, checkedIn, attended, surveyCompleted,
+    //   completionMet (all admin-only after create), plus optional
+    //   Zoom-import/audit fields written by the syncSessionAttendance
+    //   Cloud Function (Admin SDK — bypasses these rules) or by an admin's
+    //   manual correction: attendanceSource ('zoom_import'|'manual'),
+    //   attendedMinutes, attendancePercent, attendanceMatchMethod
+    //   ('email'|'name'|'unmatched'), attendanceSyncedAt,
+    //   attendanceCorrectedBy (admin uid), attendanceCorrectedAt
+    // No contact PII beyond participantName. Attendance/status fields are
+    // admin-only to write after creation — a participant can never mark
+    // themself attended.
+    // ===============================================================
+
+    // Registration is only open for an existing, PUBLISHED session whose
+    // registration deadline (if any) hasn't passed. The deadline is stored
+    // as a calendar day (midnight UTC — see bloom_session.dart), so the
+    // server allows until 36h after that instant: that covers the end of
+    // the deadline day in every US timezone (down to UTC-10). The app
+    // enforces the exact end of the participant's local deadline day; this
+    // is the tamper-proof backstop against registering days late, or for
+    // draft/cancelled/nonexistent sessions.
+    function isRegistrationOpen(sessionId) {
+      let path = /databases/$(database)/documents/bloom_sessions/$(sessionId);
+      return exists(path) && sessionAcceptsRegistrations(get(path).data);
+    }
+
+    function sessionAcceptsRegistrations(s) {
+      return s.status == 'published' &&
+        (!('registrationDeadline' in s) || s.registrationDeadline == null ||
+          request.time < s.registrationDeadline + duration.value(36, 'h'));
+    }
+
+    function isValidNewRegistration() {
+      let d = request.resource.data;
+      return hasRequiredFields(['sessionId', 'participantUid', 'participantName', 'registeredAt', 'status', 'notified', 'checkedIn', 'attended', 'surveyCompleted', 'completionMet']) &&
+        hasOnlyAllowedFields(['sessionId', 'participantUid', 'participantName', 'registeredAt', 'status', 'notified', 'checkedIn', 'attended', 'surveyCompleted', 'completionMet']) &&
+        d.participantUid == request.auth.uid &&
+        validStringLength('sessionId', 1, 200) &&
+        validStringLength('participantName', 0, 100) &&
+        d.status == 'registered' &&
+        d.notified == false &&
+        d.checkedIn == false &&
+        d.attended == false &&
+        d.surveyCompleted == false &&
+        d.completionMet == false &&
+        isRegistrationOpen(d.sessionId);
+    }
+
+    // Admin update: sessionId/participantUid/participantName/registeredAt
+    // are immutable; status/notified/checkedIn/attended/surveyCompleted/
+    // completionMet may change, plus the optional Zoom-import/manual-
+    // correction audit fields (a manual correction from the admin app sets
+    // attendanceSource == 'manual' and stamps attendanceCorrectedBy/At —
+    // the Cloud Function's own writes use the Admin SDK and never go
+    // through this rule at all).
+    function isValidAdminRegistrationUpdate() {
+      let d = request.resource.data;
+      return d.sessionId == resource.data.sessionId &&
+        d.participantUid == resource.data.participantUid &&
+        d.participantName == resource.data.participantName &&
+        d.registeredAt == resource.data.registeredAt &&
+        hasOnlyAllowedFields(['sessionId', 'participantUid', 'participantName', 'registeredAt', 'status', 'notified', 'checkedIn', 'attended', 'surveyCompleted', 'completionMet', 'attendanceSource', 'attendedMinutes', 'attendancePercent', 'attendanceMatchMethod', 'attendanceSyncedAt', 'attendanceCorrectedBy', 'attendanceCorrectedAt']) &&
+        d.status in ['registered', 'checkInAvailable', 'joinAvailable', 'attended', 'completed', 'cancelled', 'missed'] &&
+        d.notified is bool && d.checkedIn is bool && d.attended is bool &&
+        d.surveyCompleted is bool && d.completionMet is bool &&
+        (!('attendanceSource' in d) || d.attendanceSource in ['zoom_import', 'manual']) &&
+        (!('attendanceCorrectedBy' in d) || d.attendanceCorrectedBy == request.auth.uid);
+    }
+
+    // A participant's own check-in: only checkedIn/status may change
+    // (status limited to checkInAvailable/joinAvailable — never attended/
+    // completed, which stay admin-only).
+    function isValidSelfCheckIn() {
+      let d = request.resource.data;
+      return d.sessionId == resource.data.sessionId &&
+        d.participantUid == resource.data.participantUid &&
+        d.participantName == resource.data.participantName &&
+        d.registeredAt == resource.data.registeredAt &&
+        d.attended == resource.data.attended &&
+        d.surveyCompleted == resource.data.surveyCompleted &&
+        d.completionMet == resource.data.completionMet &&
+        d.notified == resource.data.notified &&
+        d.checkedIn == true &&
+        d.status in ['checkInAvailable', 'joinAvailable'];
+    }
+
+    // A participant's own exit-survey completion (SessionService.
+    // submitExitSurvey): only surveyCompleted/completionMet/status may
+    // change, and only once the admin has ALREADY recorded attended ==
+    // true on this same registration — the survey submission can never
+    // itself flip attendance, it only unlocks completion on top of an
+    // attendance value the participant does not control.
+    function isValidSelfSurveyCompletion() {
+      let d = request.resource.data;
+      return d.sessionId == resource.data.sessionId &&
+        d.participantUid == resource.data.participantUid &&
+        d.participantName == resource.data.participantName &&
+        d.registeredAt == resource.data.registeredAt &&
+        d.attended == resource.data.attended &&
+        d.notified == resource.data.notified &&
+        d.checkedIn == resource.data.checkedIn &&
+        resource.data.attended == true &&
+        resource.data.surveyCompleted == false &&
+        d.surveyCompleted == true &&
+        d.completionMet == true &&
+        d.status == 'completed';
+    }
+
+    match /session_registrations/{registrationId} {
+      // Read: the registering participant (including their own
+      // not-yet-created doc — see canReadOwnParticipantDoc), or an admin
+      // (roster/attendance views).
+      allow read: if isAdmin() || canReadOwnParticipantDoc(registrationId) || canGuardianReadParticipantDoc(registrationId);
+
+      // Create: any signed-in member, only under their own uid, and only
+      // at the doc ID "{sessionId}_{their own uid}" (checked via the
+      // participantUid field above; the ID format itself is enforced by
+      // the client always writing to that path).
+      allow create: if isAuthenticated() && isValidNewRegistration();
+
+      // Update: the registrant may check themself in, or complete their
+      // own exit survey; admins may update attendance/status/survey/
+      // completion for any correction.
+      allow update: if (isAuthenticated() && resource.data.participantUid == request.auth.uid && (isValidSelfCheckIn() || isValidSelfSurveyCompletion())) ||
+                       (isAdmin() && isValidAdminRegistrationUpdate());
+
+      allow delete: if isAdmin();
+    }
+
+    // ===============================================================
+    // Collection: attendance_sync_log
+    // Document ID: auto-generated
+    // Fields: sessionId, zoomMeetingId, triggeredByUid, startedAt,
+    //   completedAt, status ('success'|'failed'), sessionDurationMinutes,
+    //   registeredCount, matchedCount, qualifiedCount,
+    //   unmatchedRegistrantCount, unmatchedZoomParticipants (list),
+    //   errorMessage
+    // Written EXCLUSIVELY by the syncSessionAttendance Cloud Function via
+    // the Admin SDK, which bypasses these rules entirely — there is
+    // deliberately no client create/update/delete path, so a participant
+    // or even an admin's own client can never fabricate a fake "synced
+    // successfully" audit entry. This match block exists only to grant
+    // admins read access for the sync-history UI.
+    // ===============================================================
+
+    match /attendance_sync_log/{logId} {
+      allow read: if isAdmin();
+      allow write: if false;
+    }
+
+    // ===============================================================
+    // Collection: app_notifications
+    // Document ID: auto-generated
+    // Fields: uid (immutable owner ref), type, title, body,
+    //   read (bool), sessionId (optional), createdAt (server-set, immutable)
+    // A user's own notifications only. A client may only ever create a
+    // notification addressed to THEMSELF (e.g. their own registration
+    // confirmation) — fan-out to OTHER users (session updated/cancelled,
+    // "Send Reminder Now", "Notify: Starting") is exclusively done by the
+    // notifySessionRegistrants Cloud Function via the Admin SDK, which
+    // bypasses this rule entirely. Previously any signed-in user could
+    // create a notification for any uid, which let one user inject
+    // arbitrary text into another user's inbox (phishing risk) — fixed.
+    // ===============================================================
+
+    function isValidNewNotification() {
+      let d = request.resource.data;
+      return hasRequiredFields(['uid', 'type', 'title', 'body', 'read', 'createdAt']) &&
+        hasOnlyAllowedFields(['uid', 'type', 'title', 'body', 'read', 'sessionId', 'createdAt']) &&
+        d.uid == request.auth.uid &&
+        validStringLength('title', 0, 150) &&
+        validStringLength('body', 0, 1000) &&
+        d.read == false;
+    }
+
+    match /app_notifications/{notificationId} {
+      // Read: only the notification's own recipient, or an admin.
+      allow read: if isAdmin() || (isAuthenticated() && resource.data.uid == request.auth.uid);
+
+      // Create: a signed-in user may create a notification only for
+      // themself. Fan-out to other users is server-side only (Admin SDK,
+      // via notifySessionRegistrants).
+      allow create: if isAuthenticated() && isValidNewNotification();
+
+      // Update: only the recipient may mark their own notification read;
+      // no other field may change.
+      allow update: if isAuthenticated() && resource.data.uid == request.auth.uid &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['read']);
+
+      allow delete: if isAuthenticated() && resource.data.uid == request.auth.uid;
+    }
+
+    // ===============================================================
+    // Collection: session_surveys
+    // Document ID: "{sessionId}_{participantUid}" — one exit survey per
+    //   participant per session.
+    // Fields: sessionId, participantUid (immutable owner ref),
+    //   learningRating (1-5), confidenceAfter (1-5), applicationLikelihood
+    //   ('yes'|'maybe'|'notYet'), mostValuableLearning, futureSupportInterest
+    //   ('yes'|'no'|'maybe'), submittedAt (server-set, immutable)
+    // Participant-authored and immutable once submitted — an exit survey
+    // is a point-in-time response, not something either side edits later.
+    // These are POST-session self-ratings; only comparable to a
+    // pre-session session_checkins rating for the SAME participant/session
+    // — see SessionService.fetchOutcomeComparison. Never diffed against an
+    // unrelated population or session.
+    // ===============================================================
+
+    function isValidNewSurvey() {
+      let d = request.resource.data;
+      return hasRequiredFields(['sessionId', 'participantUid', 'learningRating', 'confidenceAfter', 'applicationLikelihood', 'mostValuableLearning', 'futureSupportInterest', 'submittedAt']) &&
+        hasOnlyAllowedFields(['sessionId', 'participantUid', 'learningRating', 'confidenceAfter', 'applicationLikelihood', 'mostValuableLearning', 'futureSupportInterest', 'submittedAt']) &&
+        d.participantUid == request.auth.uid &&
+        validStringLength('sessionId', 1, 200) &&
+        d.learningRating is number && d.learningRating >= 1 && d.learningRating <= 5 &&
+        d.confidenceAfter is number && d.confidenceAfter >= 1 && d.confidenceAfter <= 5 &&
+        d.applicationLikelihood in ['yes', 'maybe', 'notYet'] &&
+        validStringLength('mostValuableLearning', 0, 1000) &&
+        d.futureSupportInterest in ['yes', 'no', 'maybe'];
+    }
+
+    match /session_surveys/{surveyId} {
+      // Read: the submitting participant (including their own
+      // not-yet-created doc), or an admin (impact metrics).
+      allow read: if isAdmin() || canReadOwnParticipantDoc(surveyId) || canGuardianReadParticipantDoc(surveyId);
+
+      // Create: any signed-in member, only under their own uid.
+      allow create: if isAuthenticated() && isValidNewSurvey();
+
+      // Immutable once submitted — no update path for anyone.
+      allow update: if false;
+      allow delete: if isAdmin();
+    }
+
+    // ===============================================================
+    // Collection: session_badges
+    // Document ID: "{sessionId}_{participantUid}" — one badge per
+    //   participant per session, preventing duplicate awards.
+    // Fields: sessionId, participantUid, sessionTitle, program,
+    //   awardedAt (server-set, immutable), celebrationSeen (bool),
+    //   redemptionId (string|null, server-only — set exclusively by the
+    //   redeemReward Cloud Function's transaction via the Admin SDK when
+    //   this badge is spent toward a reward), spentAt (server-only,
+    //   alongside redemptionId)
+    // System-awarded only: written by the client's submitExitSurvey flow
+    // immediately after an admin-recorded "attended" registration, never
+    // manually created by an admin or claimed by a participant directly.
+    // celebrationSeen starts false and may only ever flip to true (by the
+    // badge's own owner), marking the one-time celebration popup shown.
+    // ===============================================================
+
+    // [badgeId] must be passed in from the match block so the doc ID can
+    // be bound to "{sessionId}_{uid}" — without this, a participant could
+    // create unlimited badge docs for the same attended session at
+    // arbitrary auto-generated IDs, each independently passing every
+    // field-level check (a real double-award vector for the rewards
+    // economy, since redemption eligibility is a raw badge count).
+    function isValidNewBadge(badgeId) {
+      let d = request.resource.data;
+      return hasRequiredFields(['sessionId', 'participantUid', 'sessionTitle', 'program', 'awardedAt', 'celebrationSeen', 'redemptionId']) &&
+        hasOnlyAllowedFields(['sessionId', 'participantUid', 'sessionTitle', 'program', 'awardedAt', 'celebrationSeen', 'redemptionId']) &&
+        d.participantUid == request.auth.uid &&
+        validStringLength('sessionId', 1, 200) &&
+        validStringLength('sessionTitle', 0, 150) &&
+        validStringLength('program', 0, 100) &&
+        d.celebrationSeen == false &&
+        d.redemptionId == null &&
+        badgeId == d.sessionId + '_' + request.auth.uid &&
+        // Only awardable when the requester was actually recorded attended
+        // on their own registration for this session — a participant can
+        // never mint themself a badge for a session they didn't attend.
+        exists(/databases/$(database)/documents/session_registrations/$(d.sessionId + '_' + request.auth.uid)) &&
+        get(/databases/$(database)/documents/session_registrations/$(d.sessionId + '_' + request.auth.uid)).data.attended == true;
+    }
+
+    match /session_badges/{badgeId} {
+      // Read: the badge owner (including their own not-yet-created doc),
+      // or an admin (impact metrics / rosters).
+      allow read: if isAdmin() || canReadOwnParticipantDoc(badgeId) || canGuardianReadParticipantDoc(badgeId);
+
+      // Create: any signed-in member, only under their own uid, only at
+      // the doc ID "{sessionId}_{their own uid}" (structurally preventing
+      // more than one badge per session per participant), and only when
+      // their own attendance record already says attended == true.
+      allow create: if isAuthenticated() && isValidNewBadge(badgeId);
+
+      // The only permitted update: the badge owner flipping
+      // celebrationSeen false -> true, once the popup has been shown.
+      // Every other field is immutable.
+      allow update: if isAuthenticated() && resource.data.participantUid == request.auth.uid &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['celebrationSeen']) &&
+        resource.data.celebrationSeen == false && request.resource.data.celebrationSeen == true;
+
+      allow delete: if isAdmin();
+    }
+
+    // ===============================================================
+    // Collection: session_checkins
+    // Document ID: "{sessionId}_{participantUid}" — one pre-session
+    //   check-in per participant per session, so registering for another
+    //   session never overwrites an earlier check-in's historical data.
+    // Fields: sessionId, participantUid (immutable owner ref),
+    //   knowledgeBefore (1-5), confidenceBefore (1-5), learningGoal,
+    //   submittedAt (server-set, immutable)
+    // Participant-authored and immutable once submitted, same posture as
+    // session_surveys — a point-in-time self-rating, not editable later.
+    // ===============================================================
+
+    function isValidNewCheckin() {
+      let d = request.resource.data;
+      return hasRequiredFields(['sessionId', 'participantUid', 'knowledgeBefore', 'confidenceBefore', 'learningGoal', 'submittedAt']) &&
+        hasOnlyAllowedFields(['sessionId', 'participantUid', 'knowledgeBefore', 'confidenceBefore', 'learningGoal', 'submittedAt']) &&
+        d.participantUid == request.auth.uid &&
+        validStringLength('sessionId', 1, 200) &&
+        d.knowledgeBefore is number && d.knowledgeBefore >= 1 && d.knowledgeBefore <= 5 &&
+        d.confidenceBefore is number && d.confidenceBefore >= 1 && d.confidenceBefore <= 5 &&
+        validStringLength('learningGoal', 0, 500);
+    }
+
+    match /session_checkins/{checkinId} {
+      // Read: the submitting participant (including their own
+      // not-yet-created doc), or an admin (impact metrics).
+      allow read: if isAdmin() || canReadOwnParticipantDoc(checkinId) || canGuardianReadParticipantDoc(checkinId);
+
+      // Create: any signed-in member, only under their own uid.
+      allow create: if isAuthenticated() && isValidNewCheckin();
+
+      // Immutable once submitted — no update path for anyone.
+      allow update: if false;
+      allow delete: if isAdmin();
+    }
+
+    // ===============================================================
+    // Collection: donations
+    // Document ID: auto-generated
+    // Fields: partnerId (immutable owner ref), partnerName, email,
+    //   amount (integer cents), currency, purpose, status
+    //   ('pending'|'paid'|'failed'|'cancelled'|'refunded'),
+    //   stripeCheckoutSessionId, stripePaymentIntentId, createdAt
+    //   (server-set, immutable), paidAt
+    // Written EXCLUSIVELY by the createDonationCheckout (creates, status
+    // 'pending') and stripeWebhook (updates to 'paid'/'failed', ONLY
+    // after Stripe itself confirms the payment) Cloud Functions via the
+    // Admin SDK — there is deliberately NO client create/update path at
+    // all. The Flutter app returning from Stripe's success/cancel URL
+    // proves nothing about payment status on its own; it can only ever
+    // READ this doc to display the real, server-confirmed status. This
+    // is the same trust boundary already used for attendance_sync_log
+    // and reward_redemptions (both also Admin-SDK-write-only).
+    // ===============================================================
+
+    match /donations/{donationId} {
+      // Read: the contributing partner (their own donation history), or
+      // an admin (Donations dashboard). No participant/member access —
+      // a donation is Community-Partner-and-admin business, not
+      // something a regular participant needs or should see.
+      allow read: if isAdmin() || (isAuthenticated() && resource.data.partnerId == request.auth.uid);
+      allow write: if false;
+    }
+
+    // ===============================================================
+    // Collection: stripe_webhook_events
+    // Document ID: the Stripe event ID (e.g. "evt_...")
+    // Fields: type, processedAt, donationId (optional), note (optional)
+    // Written EXCLUSIVELY by the stripeWebhook Cloud Function via the
+    // Admin SDK — this is the idempotency ledger that makes webhook
+    // processing safe against Stripe's at-least-once delivery guarantee
+    // (a retried/duplicated event is recognized here and skipped rather
+    // than double-processing a payment). No client read or write path;
+    // this collection carries no information a client needs directly.
+    // ===============================================================
+
+    match /stripe_webhook_events/{eventId} {
+      allow read: if isAdmin();
+      allow write: if false;
+    }
+  }
+}
