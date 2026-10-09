@@ -63,7 +63,7 @@ class DefaultFirebaseOptions {
     messagingSenderId: '317086878005',
     projectId: 'bloomg2w',
     storageBucket: 'bloomg2w.firebasestorage.app',
-    iosBundleId: 'com.example.bloomG2w',
+    iosBundleId: 'org.bloomg2w.app',
   );
 
   static const FirebaseOptions macos = FirebaseOptions(
@@ -72,7 +72,7 @@ class DefaultFirebaseOptions {
     messagingSenderId: '317086878005',
     projectId: 'bloomg2w',
     storageBucket: 'bloomg2w.firebasestorage.app',
-    iosBundleId: 'com.example.bloomG2w',
+    iosBundleId: 'org.bloomg2w.app',
   );
 
   static const FirebaseOptions windows = FirebaseOptions(
